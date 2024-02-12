@@ -3,17 +3,18 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Kreait\Firebase\Contract\Database;
+use Kreait\Firebase\Contract\Firestore;
 use Kreait\Firebase\Contract\Storage;
+// use Google\Cloud\Firestore\FirestoreClient;
 
 class ProductController extends Controller
 {
-    protected $database;
+    protected $firestore;
     protected $firebaseStorage;
 
-    public function __construct(Database $database, Storage $firebaseStorage)
+    public function __construct(Firestore $firestore, Storage $firebaseStorage)
     {
-        $this->database = $database;
+        $this->firestore = $firestore;
         $this->firebaseStorage = $firebaseStorage;
     }
 
@@ -22,7 +23,17 @@ class ProductController extends Controller
      */
     public function index()
     {
-        $products = $this->database->getReference('products')->getValue();
+        $products = [];
+        $productRef = app('firebase.firestore')->database()->collection('products')->documents();
+
+        foreach ($productRef as $product) {
+            $productData = $product->data();
+            $productData['id'] = $product->id();
+            $products[] = $productData;
+        }
+
+        // var_dump($productRef);
+
         return view('products.index', compact('products'));
     }
 
@@ -31,8 +42,7 @@ class ProductController extends Controller
      */
     public function create()
     {
-        $category = $this->database->getReference('category')->getValue();
-        return view('products.createProduct', compact('category'));
+        return view('products.createProduct');
     }
 
     /**
@@ -40,32 +50,33 @@ class ProductController extends Controller
      */
     public function store(Request $request)
     {
-
-        if ($request->hasFile('image')) {
-            $file = $request->file('image');
-
-            $bucket = $this->firebaseStorage->getBucket();
-            $object = $bucket->upload(file_get_contents($file->getPathname()), [
-                'name' => 'images/' . $file->getClientOriginalName(),
-            ]);
-
-            $imageUrl = $object->signedUrl(now()->addYears(24));
-        }
-
-        $postData = [
-            'name'=> $request->productName,
-            'desc'=> $request->description,
-            'category'=> $request->category,
-            'price'=> $request->price,
-            'stock'=> $request->stock,
-            'image_url' => $imageUrl
-        ];
-
-        // $postRef = $this->database->getReference('products')->push($postData);
-
         try {
-            $this->database->getReference('products')->push($postData);
-            return redirect()->route('products.index')->with('success', 'yey');
+
+            if ($request->hasFile('image')) {
+                $file = $request->file('image');
+
+                $bucket = $this->firebaseStorage->getBucket();
+                $object = $bucket->upload(file_get_contents($file->getPathname()), [
+                    'name' => 'products/' . $file->getClientOriginalName(),
+                ]);
+
+                $imageUrl = $object->signedUrl(now()->addYears(24));
+            }
+
+            $newproducts = [
+                'category' => $request->category,
+                'desc' => $request->description,
+                'name' => $request->productName,
+                'price' => $request->price,
+                'stock' => $request->stock,
+                'image' => $imageUrl,
+            ];
+
+            // var_dump($imageUrl);
+
+
+            app('firebase.firestore')->database()->collection('products')->add($newproducts);
+            return redirect()->route('products.index');
         } catch (\Exception $e) {
             return redirect()->route('products.index')->with('error', 'Error Ngab: ' . $e->getMessage());
         }
@@ -84,8 +95,12 @@ class ProductController extends Controller
      */
     public function edit(string $id)
     {
-        $category = $this->database->getReference('category')->getValue();
-        return view('products.editProduct', compact('category'));
+        $productRef = app('firebase.firestore')->database()->collection('products');
+        $document = $productRef->document($id);
+        $productId = $id;
+        $productData = $document->snapshot()->data();
+
+        return view('products.editProduct', compact('productData','productId'));
     }
 
     /**
@@ -93,31 +108,84 @@ class ProductController extends Controller
      */
     public function update(Request $request, string $id)
     {
-        //
+        try {
+            // Ambil referensi dokumen produk
+            $productRef = app('firebase.firestore')->database()->collection('products')->document($id);
+            $productData = $productRef->snapshot()->data();
+
+            if (!$productData) {
+                return redirect()->route('products.index')->with('error', 'Product not found');
+            }
+
+            // Hapus gambar lama jika ada
+            if ($request->hasFile('image')) {
+                $imageUrl = $productData['image'];
+                $pathInfo = pathinfo(parse_url($imageUrl, PHP_URL_PATH));
+                $filePath = 'products/' . $pathInfo['basename'];
+
+                $firebaseStorage =  $this->firebaseStorage->getBucket();
+                $firebaseStorage->object($filePath)->delete();
+
+                // Unggah gambar baru
+                $file = $request->file('image');
+                $bucket = $this->firebaseStorage->getBucket();
+                $object = $bucket->upload(file_get_contents($file->getPathname()), [
+                    'name' => 'products/' . $file->getClientOriginalName(),
+                ]);
+
+                $imageUrl = $object->signedUrl(now()->addYears(24));
+            }
+
+            // Perbarui data produk
+            $updatedProductData = [
+                'category' => $request->category,
+                'desc' => $request->description,
+                'name' => $request->productName,
+                'price' => $request->price,
+                'stock' => $request->stock,
+                'image' => $imageUrl ?? $productData['image'], // Gunakan URL gambar baru jika ada, jika tidak gunakan yang lama
+            ];
+
+            $productRef->set($updatedProductData, ['merge' => true]);
+
+            return redirect()->route('products.index')->with('success', 'Product updated successfully');
+        } catch (\Exception $e) {
+            return redirect()->route('products.index')->with('error', 'Error updating product: ' . $e->getMessage());
+        }
     }
+
 
     /**
      * Remove the specified resource from storage.
      */
     public function destroy(string $id)
     {
+        $productRef = app('firebase.firestore')->database()->collection('products');
 
-        $productRef = $this->database->getReference('products')->getChild($id);
+        $document = $productRef->document($id);
+        $productData = $document->snapshot()->data();
 
-        if (!$productRef->getValue()) {
+        if (!$productData) {
             return redirect()->route('products.index')->with('error', 'Product not found');
         }
 
-        $imageUrl = $productRef->getChild('image_url')->getValue();
-        $productRef->remove();
+        // Delete the product document
+        $document->delete();
 
-        if ($imageUrl) {
-            $firebaseStorage =  $this->firebaseStorage->getBucket();
+        // Check if the product has an image
+        if ($productData['image']) {
+            try {
+                $imageUrl = $productData['image'];
 
-            $pathInfo = pathinfo(parse_url($imageUrl, PHP_URL_PATH));
-            $filePath = 'images/' . $pathInfo['basename'];
+                $pathInfo = pathinfo(parse_url($imageUrl, PHP_URL_PATH));
+                $filePath = 'products/' . $pathInfo['basename'];
 
-            $firebaseStorage->object($filePath)->delete();
+                $firebaseStorage =  $this->firebaseStorage->getBucket();
+                $firebaseStorage->object($filePath)->delete();
+            } catch (\Exception $e) {
+                // Handle any errors
+                return redirect()->route('products.index')->with('error', 'Error deleting image: ' . $e->getMessage());
+            }
         }
 
         return redirect()->route('products.index')->with('success', 'Product deleted successfully');
